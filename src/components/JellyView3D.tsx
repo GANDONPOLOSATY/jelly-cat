@@ -2,11 +2,11 @@ import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import type { CatSkin3D } from '../skins3d';
 import { sound } from '../audio';
-import { createJellyCatGeometry, createCatFaceGroup } from '../jellyModel';
+import { createCat3DModel } from '../jellyModel';
 
 interface JellyView3DProps {
   skin: CatSkin3D;
-  lightDirection: number; // 0 to 1 slider as in the reference video
+  lightDirection: number;
   quality: 'Low' | 'Medium' | 'Ultra';
   enableBlur: boolean;
   onPet: () => void;
@@ -23,47 +23,42 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
 
-  // References to 3D entities
-  const catMeshRef = useRef<THREE.Mesh | null>(null);
-  const faceGroupRef = useRef<THREE.Group | null>(null);
+  const catGroupRef = useRef<THREE.Group | null>(null);
   const catMaterialRef = useRef<THREE.MeshPhysicalMaterial | null>(null);
   const dirLightRef = useRef<THREE.DirectionalLight | null>(null);
   const pointLightRef = useRef<THREE.PointLight | null>(null);
-  const floorMeshRef = useRef<THREE.Mesh | null>(null);
 
-  // Deformation & Physics
-  const originalPositionsRef = useRef<Float32Array | null>(null);
-  const currentVelocitiesRef = useRef<Float32Array | null>(null);
+  // Squish spring physics (Scale & Shear)
+  const scaleRef = useRef(new THREE.Vector3(1, 1, 1));
+  const targetScaleRef = useRef(new THREE.Vector3(1, 1, 1));
+  const scaleVelRef = useRef(new THREE.Vector3(0, 0, 0));
 
-  // Mouse / Pointer Drag state
+  const rotRef = useRef(new THREE.Euler(0, 0, 0));
+  const targetRotRef = useRef(new THREE.Euler(0, 0, 0));
+  const rotVelRef = useRef(new THREE.Vector3(0, 0, 0));
+
   const isPointerDownRef = useRef(false);
   const lastPointerPosRef = useRef({ x: 0, y: 0 });
-  const dragPlaneIntersectRef = useRef<THREE.Vector3 | null>(null);
-  const dragForceRef = useRef<THREE.Vector3>(new THREE.Vector3());
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  const raycasterRef = useRef(new THREE.Raycaster());
-
-  // Pet distance tracker
   const petDistanceRef = useRef(0);
 
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
 
-    // 1. Scene & Renderer setup
+    // 1. Scene & Camera
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf1f2f5);
+    scene.background = new THREE.Color(0xf1f3f6);
 
     const camera = new THREE.PerspectiveCamera(
       42,
       container.clientWidth / container.clientHeight,
       0.1,
-      100
+      50
     );
-    camera.position.set(0, 1.2, 5.5);
-    camera.lookAt(0, 0.2, 0);
-    cameraRef.current = camera;
+    camera.position.set(0, 0.8, 5.2);
+    camera.lookAt(0, 0.1, 0);
 
+    // 2. Renderer
     const renderer = new THREE.WebGLRenderer({
       antialias: quality !== 'Low',
       powerPreference: 'high-performance',
@@ -76,150 +71,83 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
     renderer.toneMappingExposure = 1.15;
     container.appendChild(renderer.domElement);
 
-    // 2. Lighting (Studio light matching the TikTok video)
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.9);
+    // 3. Studio Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 1.2);
     scene.add(ambientLight);
 
     const dirLight = new THREE.DirectionalLight(0xffffff, 2.8);
     dirLight.position.set(3, 6, 4);
     dirLight.castShadow = true;
-    dirLight.shadow.mapSize.width = quality === 'Ultra' ? 2048 : 1024;
-    dirLight.shadow.mapSize.height = quality === 'Ultra' ? 2048 : 1024;
-    dirLight.shadow.camera.near = 0.5;
-    dirLight.shadow.camera.far = 15;
-    dirLight.shadow.camera.left = -3;
-    dirLight.shadow.camera.right = 3;
-    dirLight.shadow.camera.top = 3;
-    dirLight.shadow.camera.bottom = -3;
+    dirLight.shadow.mapSize.width = 1024;
+    dirLight.shadow.mapSize.height = 1024;
     dirLight.shadow.bias = -0.0005;
     scene.add(dirLight);
     dirLightRef.current = dirLight;
 
-    // Rim/Back Light to accentuate transmission & glass edges
-    const rimLight = new THREE.DirectionalLight(0xffffff, 1.6);
-    rimLight.position.set(-4, 3, -4);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 1.5);
+    rimLight.position.set(-4, 2, -4);
     scene.add(rimLight);
 
-    // Glowing point light centered inside the jelly cat
-    const pointLight = new THREE.PointLight(skin.glowColor, 3.5, 7);
-    pointLight.position.set(0, 0.3, 0);
+    const pointLight = new THREE.PointLight(skin.glowColor, 3, 6);
+    pointLight.position.set(0, 0.4, 0);
     scene.add(pointLight);
     pointLightRef.current = pointLight;
 
-    // 3. Studio Stage Backdrop & Ground (Soft bevel floor)
-    const floorGeom = new THREE.PlaneGeometry(30, 30, 32, 32);
+    // 4. Studio Floor Platform (bevel track like in TikTok video)
+    const floorGeom = new THREE.PlaneGeometry(24, 24);
     const floorMat = new THREE.MeshStandardMaterial({
       color: 0xebedf2,
-      roughness: 0.45,
-      metalness: 0.05,
+      roughness: 0.5,
     });
     const floor = new THREE.Mesh(floorGeom, floorMat);
     floor.rotation.x = -Math.PI / 2;
-    floor.position.y = -1.2;
+    floor.position.y = -1.0;
     floor.receiveShadow = true;
     scene.add(floor);
-    floorMeshRef.current = floor;
 
-    // Ground indentation slot (like in the video's slider track)
-    const slotGeom = new THREE.BoxGeometry(4.8, 0.15, 1.8);
-    const slotMat = new THREE.MeshStandardMaterial({
-      color: 0xd8dbe2,
-      roughness: 0.6,
-    });
+    // Studio track bevel slot (under the cat)
+    const slotGeom = new THREE.CylinderGeometry(1.9, 1.9, 0.1, 32);
+    const slotMat = new THREE.MeshStandardMaterial({ color: 0xdde0e8, roughness: 0.6 });
     const slot = new THREE.Mesh(slotGeom, slotMat);
-    slot.position.set(0, -1.25, 0);
+    slot.position.set(0, -1.02, 0);
     slot.receiveShadow = true;
     scene.add(slot);
 
-    // 4. Jelly Physical Material (Real 3D transmission shader like in video)
+    // 5. Jelly Physical Material (Real 3D glass transmission shader)
     const jellyMaterial = new THREE.MeshPhysicalMaterial({
       color: new THREE.Color(skin.color),
-      emissive: new THREE.Color(skin.color).multiplyScalar(0.12),
+      emissive: new THREE.Color(skin.color).multiplyScalar(0.1),
       roughness: skin.roughness,
       metalness: 0.05,
       transmission: skin.transmission,
       ior: skin.ior,
       thickness: skin.thickness,
-      specularIntensity: 1.2,
-      specularColor: new THREE.Color(0xffffff),
       clearcoat: 1.0,
       clearcoatRoughness: 0.05,
       attenuationColor: new THREE.Color(skin.glowColor),
-      attenuationDistance: 1.4,
+      attenuationDistance: 1.5,
       transparent: true,
       opacity: 0.98,
     });
     catMaterialRef.current = jellyMaterial;
 
-    // 5. Build Cat Mesh & Cache Vertices
-    const geometry = createJellyCatGeometry();
-    const catMesh = new THREE.Mesh(geometry, jellyMaterial);
-    catMesh.castShadow = true;
-    catMesh.receiveShadow = true;
-    catMesh.position.set(0, 0, 0);
-    scene.add(catMesh);
-    catMeshRef.current = catMesh;
+    // 6. Build Clean 3D Cat Model
+    const catModel = createCat3DModel(jellyMaterial);
+    scene.add(catModel);
+    catGroupRef.current = catModel;
 
-    // Cache initial vertex positions & velocity buffers
-    const posAttr = geometry.attributes.position as THREE.BufferAttribute;
-    const vertexCount = posAttr.count;
-    const origPos = new Float32Array(posAttr.array.length);
-    origPos.set(posAttr.array);
-    originalPositionsRef.current = origPos;
-    currentVelocitiesRef.current = new Float32Array(posAttr.array.length);
-
-    // Face Group
-    const face = createCatFaceGroup();
-    catMesh.add(face);
-    faceGroupRef.current = face;
-
-    // 6. Raycasting & Interaction Planes
-    const interactionPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-
-    const getPointerNDC = (clientX: number, clientY: number) => {
-      const rect = container.getBoundingClientRect();
-      return new THREE.Vector2(
-        ((clientX - rect.left) / rect.width) * 2 - 1,
-        -((clientY - rect.top) / rect.height) * 2 + 1
-      );
-    };
-
+    // 7. Interaction Handlers
     const handlePointerDown = (e: PointerEvent) => {
       container.setPointerCapture(e.pointerId);
       isPointerDownRef.current = true;
       lastPointerPosRef.current = { x: e.clientX, y: e.clientY };
 
-      const ndc = getPointerNDC(e.clientX, e.clientY);
-      raycasterRef.current.setFromCamera(ndc, camera);
+      sound.startPurr();
+      sound.playSquish(0.9);
+      onSquish();
 
-      // Check intersection with cat
-      const intersects = raycasterRef.current.intersectObject(catMesh, false);
-      if (intersects.length > 0) {
-        sound.startPurr();
-        sound.playSquish(0.9);
-        onSquish();
-
-        const hitPoint = intersects[0].point;
-        dragPlaneIntersectRef.current = hitPoint.clone();
-
-        // Apply instant radial impulse to vertices around hit point
-        const pos = geometry.attributes.position as THREE.BufferAttribute;
-        const vels = currentVelocitiesRef.current;
-        if (vels) {
-          const v = new THREE.Vector3();
-          for (let i = 0; i < vertexCount; i++) {
-            v.fromBufferAttribute(pos, i);
-            const d = v.distanceTo(hitPoint);
-            if (d < 1.4) {
-              const push = (1 - d / 1.4) * 0.45;
-              const dir = v.clone().sub(hitPoint).normalize();
-              vels[i * 3] += dir.x * push;
-              vels[i * 3 + 1] += dir.y * push;
-              vels[i * 3 + 2] += dir.z * push;
-            }
-          }
-        }
-      }
+      // Immediate squish bounce: squash Y, stretch X and Z
+      targetScaleRef.current.set(1.28, 0.72, 1.25);
     };
 
     const handlePointerMove = (e: PointerEvent) => {
@@ -229,7 +157,6 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
       const dy = e.clientY - lastPointerPosRef.current.y;
       lastPointerPosRef.current = { x: e.clientX, y: e.clientY };
 
-      // Accumulate pet distance
       petDistanceRef.current += Math.hypot(dx, dy);
       if (petDistanceRef.current > 180) {
         petDistanceRef.current = 0;
@@ -237,35 +164,19 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
         sound.playSquish(0.4);
       }
 
-      // Drag projection on 3D plane
-      const ndc = getPointerNDC(e.clientX, e.clientY);
-      raycasterRef.current.setFromCamera(ndc, camera);
-      const planeIntersect = new THREE.Vector3();
-      raycasterRef.current.ray.intersectPlane(interactionPlane, planeIntersect);
+      // Drag squish & tilt
+      const tiltX = THREE.MathUtils.clamp(-dy * 0.008, -0.4, 0.4);
+      const tiltY = THREE.MathUtils.clamp(dx * 0.008, -0.6, 0.6);
+      targetRotRef.current.x = tiltX;
+      targetRotRef.current.y = tiltY;
 
-      if (planeIntersect) {
-        dragForceRef.current.set(
-          (dx / container.clientWidth) * 6,
-          (-dy / container.clientHeight) * 6,
-          0
-        );
-
-        // Pull closest vertices towards pointer
-        const pos = geometry.attributes.position as THREE.BufferAttribute;
-        const vels = currentVelocitiesRef.current;
-        if (vels) {
-          const v = new THREE.Vector3();
-          for (let i = 0; i < vertexCount; i++) {
-            v.fromBufferAttribute(pos, i);
-            const d = v.distanceTo(planeIntersect);
-            if (d < 1.8) {
-              const pullFactor = Math.pow(1 - d / 1.8, 1.5) * 0.35;
-              vels[i * 3] += dragForceRef.current.x * pullFactor;
-              vels[i * 3 + 1] += dragForceRef.current.y * pullFactor;
-              vels[i * 3 + 2] += (Math.random() - 0.5) * 0.1;
-            }
-          }
-        }
+      // Dynamic stretch based on drag speed
+      const speed = Math.hypot(dx, dy);
+      const stretch = Math.min(speed * 0.015, 0.45);
+      if (Math.abs(dx) > Math.abs(dy)) {
+        targetScaleRef.current.set(1 + stretch, 1 - stretch * 0.5, 1);
+      } else {
+        targetScaleRef.current.set(1 - stretch * 0.5, 1 + stretch, 1 - stretch * 0.5);
       }
     };
 
@@ -278,14 +189,16 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
         sound.stopPurr();
         sound.playBoing();
 
-        // Release rebound shockwave
-        const vels = currentVelocitiesRef.current;
-        if (vels) {
-          for (let i = 0; i < vertexCount; i++) {
-            vels[i * 3] *= 1.4;
-            vels[i * 3 + 1] *= 1.4;
-          }
-        }
+        // Release rebound to neutral scale with overshoot
+        targetScaleRef.current.set(1, 1, 1);
+        targetRotRef.current.set(0, 0, 0);
+
+        // Add energetic rebound impulse
+        scaleVelRef.current.set(
+          (Math.random() - 0.5) * 0.15,
+          (Math.random() - 0.5) * 0.15,
+          (Math.random() - 0.5) * 0.15
+        );
       }
     };
 
@@ -294,7 +207,7 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
     container.addEventListener('pointerup', handlePointerUp);
     container.addEventListener('pointercancel', handlePointerUp);
 
-    // 7. Resize handling
+    // 8. Resize
     const handleResize = () => {
       if (!container) return;
       camera.aspect = container.clientWidth / container.clientHeight;
@@ -303,50 +216,55 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
     };
     window.addEventListener('resize', handleResize);
 
-    // 8. Animation & Physics Simulation Loop
+    // 9. Animation Loop with Spring Harmonic Physics
     let animId: number;
     let clock = new THREE.Clock();
 
     const animate = () => {
       const time = clock.getElapsedTime();
-      const delta = Math.min(clock.getDelta(), 0.05);
+      const delta = Math.min(clock.getDelta(), 0.04);
 
-      // Idle breathing and slight float
-      const breathe = Math.sin(time * 2.8) * 0.04;
-      catMesh.position.y = breathe;
-      catMesh.rotation.y = Math.sin(time * 0.9) * 0.08;
+      if (catGroupRef.current) {
+        const cat = catGroupRef.current;
 
-      // Soft body spring physics simulation across all mesh vertices
-      const pos = geometry.attributes.position as THREE.BufferAttribute;
-      const positions = pos.array as Float32Array;
-      const originals = originalPositionsRef.current;
-      const vels = currentVelocitiesRef.current;
+        // Idle breathing and gentle floating bob
+        const breathe = Math.sin(time * 2.8) * 0.025;
+        const idleRot = Math.sin(time * 0.8) * 0.06;
 
-      if (originals && vels) {
-        const springK = 14.0; // Hooke's spring constant
-        const damping = 0.88; // Jelly dampening
+        // Spring physics for scale (Jelly Jiggle)
+        const springK = 80.0;
+        const damp = 0.84;
 
-        for (let i = 0; i < vertexCount; i++) {
-          const idx = i * 3;
+        const curS = scaleRef.current;
+        const tgtS = targetScaleRef.current;
+        const velS = scaleVelRef.current;
 
-          // Displacements from rest
-          const dx = originals[idx] - positions[idx];
-          const dy = originals[idx + 1] - positions[idx + 1];
-          const dz = originals[idx + 2] - positions[idx + 2];
+        velS.x = (velS.x + (tgtS.x - curS.x) * springK * delta) * damp;
+        velS.y = (velS.y + (tgtS.y - curS.y) * springK * delta) * damp;
+        velS.z = (velS.z + (tgtS.z - curS.z) * springK * delta) * damp;
 
-          // Acceleration = Spring force
-          vels[idx] = (vels[idx] + dx * springK * delta) * damping;
-          vels[idx + 1] = (vels[idx + 1] + dy * springK * delta) * damping;
-          vels[idx + 2] = (vels[idx + 2] + dz * springK * delta) * damping;
+        curS.add(velS);
 
-          // Integrate position
-          positions[idx] += vels[idx];
-          positions[idx + 1] += vels[idx + 1];
-          positions[idx + 2] += vels[idx + 2];
-        }
+        // Apply scale with breathing modulation
+        cat.scale.set(
+          curS.x * (1 - breathe * 0.4),
+          curS.y * (1 + breathe),
+          curS.z * (1 - breathe * 0.4)
+        );
 
-        pos.needsUpdate = true;
-        geometry.computeVertexNormals();
+        // Spring physics for rotation
+        const curR = rotRef.current;
+        const tgtR = targetRotRef.current;
+        const velR = rotVelRef.current;
+
+        velR.x = (velR.x + (tgtR.x - curR.x) * springK * delta) * damp;
+        velR.y = (velR.y + (tgtR.y + idleRot - curR.y) * springK * delta) * damp;
+
+        curR.x += velR.x;
+        curR.y += velR.y;
+
+        cat.rotation.set(curR.x, curR.y, 0);
+        cat.position.y = -0.2 + breathe * 0.6;
       }
 
       renderer.render(scene, camera);
@@ -369,10 +287,9 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
     };
   }, [quality]);
 
-  // Update light direction slider (like in TikTok video)
+  // Update light direction slider
   useEffect(() => {
     if (dirLightRef.current) {
-      // Map 0..1 to an angle around the cat
       const angle = (lightDirection - 0.5) * Math.PI * 1.4;
       dirLightRef.current.position.set(
         Math.sin(angle) * 6,
@@ -382,12 +299,12 @@ export const JellyView3D: React.FC<JellyView3DProps> = ({
     }
   }, [lightDirection]);
 
-  // Update Skin 3D Materials dynamically
+  // Update materials
   useEffect(() => {
     if (catMaterialRef.current) {
       const mat = catMaterialRef.current;
       mat.color.set(skin.color);
-      mat.emissive.set(skin.color).multiplyScalar(0.12);
+      mat.emissive.set(skin.color).multiplyScalar(0.1);
       mat.roughness = skin.roughness;
       mat.transmission = skin.transmission;
       mat.ior = skin.ior;
